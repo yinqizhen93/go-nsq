@@ -21,6 +21,7 @@ const (
 	FrameTypeMessage  int32 = 2
 )
 
+// topName 有效性验证的正则表达式 只能包含数字，字母，点，下划线， 以及结尾可以为#ephemeral
 var validTopicChannelNameRegex = regexp.MustCompile(`^[\.a-zA-Z0-9_-]+(#ephemeral)?$`)
 
 // IsValidTopicName checks a topic name for correctness
@@ -33,6 +34,7 @@ func IsValidChannelName(name string) bool {
 	return isValidName(name)
 }
 
+// isValidName 长度为1~64之间，且符合字符要求， channel和topic都要满足要求
 func isValidName(name string) bool {
 	if len(name) > 64 || len(name) < 1 {
 		return false

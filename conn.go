@@ -86,6 +86,7 @@ type Conn struct {
 }
 
 // NewConn returns a new Conn instance
+// delegate 消费者建立的连接传入consumerConnDelegate， 生产者建立的连接传入producerConnDelegate
 func NewConn(addr string, config *Config, delegate ConnDelegate) *Conn {
 	if !config.initialized {
 		panic("Config must be created with NewConfig()")
@@ -511,13 +512,14 @@ func (c *Conn) auth(secret string) error {
 	return nil
 }
 
+// readLoop循环读取nsqd返回的消息
 func (c *Conn) readLoop() {
 	delegate := &connMessageDelegate{c}
 	for {
 		if atomic.LoadInt32(&c.closeFlag) == 1 {
 			goto exit
 		}
-
+		// 读取返回的消息，并按协议解包
 		frameType, data, err := ReadUnpackedResponse(c)
 		if err != nil {
 			if err == io.EOF && atomic.LoadInt32(&c.closeFlag) == 1 {
@@ -529,7 +531,7 @@ func (c *Conn) readLoop() {
 			}
 			goto exit
 		}
-
+		// 心跳检测消息，回调OnHeartbeat发送Nop
 		if frameType == FrameTypeResponse && bytes.Equal(data, []byte("_heartbeat_")) {
 			c.log(LogLevelDebug, "heartbeat received")
 			c.delegate.OnHeartbeat(c)
@@ -543,9 +545,14 @@ func (c *Conn) readLoop() {
 		}
 
 		switch frameType {
+		// FrameTypeResponse 收到的返回消息
+		// 对消费者建立的连接， 如果是CloseWait， 则服务端通知CloseWait，不要再发送消息， 否则无逻辑处理
+		// 对生产者建立的连接，将 w.responseChan <- data， w为producer
 		case FrameTypeResponse:
 			c.delegate.OnResponse(c, data)
+			// FrameTypeMessage正常接收到消息
 		case FrameTypeMessage:
+			// 解析放回的消息
 			msg, err := DecodeMessage(data)
 			if err != nil {
 				c.log(LogLevelError, "IO error - %s", err)
@@ -557,7 +564,7 @@ func (c *Conn) readLoop() {
 
 			atomic.AddInt64(&c.messagesInFlight, 1)
 			atomic.StoreInt64(&c.lastMsgTimestamp, time.Now().UnixNano())
-
+			// 往incomingMsg channel发送接收到的msg， 消费端Handler 消费消息
 			c.delegate.OnMessage(c, msg)
 		case FrameTypeError:
 			c.log(LogLevelError, "protocol error - %s", data)
@@ -584,14 +591,17 @@ exit:
 	c.log(LogLevelInfo, "readLoop exiting")
 }
 
+//  writeLoop 循环写入数据到Conn
 func (c *Conn) writeLoop() {
 	for {
 		select {
+		// 收到退出信息，则退出
 		case <-c.exitChan:
 			c.log(LogLevelInfo, "breaking out of writeLoop")
 			// Indicate drainReady because we will not pull any more off msgResponseChan
 			close(c.drainReady)
 			goto exit
+		// 收到新的cmd, 则执行行的command
 		case cmd := <-c.cmdChan:
 			err := c.WriteCommand(cmd)
 			if err != nil {
@@ -599,6 +609,9 @@ func (c *Conn) writeLoop() {
 				c.close()
 				continue
 			}
+		// 消费者收到服务端推送消息，按消费情况，处理，
+		// 消费成功 OnMessageFinished 发送FIN告诉nsqd消费成功，可以删除这条消息
+		// 消费失败 OnMessageRequeued 发送REQ告诉nsq消费失败， 需要将这条消息重新放入队列
 		case resp := <-c.msgResponseChan:
 			// Decrement this here so it is correct even if we can't respond to nsqd
 			msgsInFlight := atomic.AddInt64(&c.messagesInFlight, -1)

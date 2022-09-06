@@ -27,7 +27,7 @@ type producerConn interface {
 type Producer struct {
 	id     int64
 	addr   string
-	conn   producerConn
+	conn   producerConn // 实际使用的是connection文件里Conn， 其实现了producerConn
 	config Config
 
 	logger   []logger
@@ -254,6 +254,7 @@ func (w *Producer) sendCommand(cmd *Command) error {
 		close(doneChan)
 		return err
 	}
+	// t.finish 结束此处阻塞
 	t := <-doneChan
 	return t.Error
 }
@@ -304,7 +305,7 @@ func (w *Producer) connect() error {
 	}
 
 	w.log(LogLevelInfo, "(%s) connecting to nsqd", w.addr)
-
+	// w.conn connection 文件里的Conn
 	w.conn = NewConn(w.addr, &w.config, &producerConnDelegate{w})
 	w.conn.SetLoggerLevel(w.getLogLevel())
 	format := fmt.Sprintf("%3d (%%s)", w.id)
@@ -339,9 +340,12 @@ func (w *Producer) close() {
 	}()
 }
 
+// router 在Producer 建立connection时异步运行，
+// Producer建立connection 是lazy模式， 只在Ping和Publish调用时建立
 func (w *Producer) router() {
 	for {
 		select {
+		// publish 会往transactionChan发送一个transaction， 一个Ping command或一个包含消息的Publish command
 		case t := <-w.transactionChan:
 			w.transactions = append(w.transactions, t)
 			err := w.conn.WriteCommand(t.cmd)
@@ -349,7 +353,9 @@ func (w *Producer) router() {
 				w.log(LogLevelError, "(%s) sending command - %s", w.conn.String(), err)
 				w.close()
 			}
+			// publish端发送command后收到的response, 会放入w.responseChan
 		case data := <-w.responseChan:
+			// popTransaction 会调用t.finish(), doneChan 回收到消息，同步Publish结束
 			w.popTransaction(FrameTypeResponse, data)
 		case data := <-w.errorChan:
 			w.popTransaction(FrameTypeError, data)
