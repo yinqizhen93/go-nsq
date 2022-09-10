@@ -26,6 +26,7 @@ import (
 // When the return value is nil Consumer will automatically handle FINishing.
 //
 // When the returned value is non-nil Consumer will automatically handle REQueing.
+// Handler 消费端负责实现此接口，用来处理消息，处理成功consumer发送给服务端FIN, 处理失败发送REQ
 type Handler interface {
 	HandleMessage(message *Message) error
 }
@@ -36,6 +37,7 @@ type Handler interface {
 // 	consumer.AddHandler(nsq.HandlerFunc(func(m *Message) error {
 // 		// handle the message
 // 	}))
+// HandlerFunc 接口型函数, 实现了Handle接口, 可以将其它函数转为Handler借口
 type HandlerFunc func(message *Message) error
 
 // HandleMessage implements the Handler interface
@@ -86,13 +88,13 @@ const (
 // reconnection) to any discovered nsqds.
 type Consumer struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
-	messagesReceived uint64
-	messagesFinished uint64
-	messagesRequeued uint64
-	totalRdyCount    int64
-	backoffDuration  int64
-	backoffCounter   int32
-	maxInFlight      int32
+	messagesReceived uint64 // 接收到的消息数量
+	messagesFinished uint64 // 成功消费的消息数量
+	messagesRequeued uint64 // 消费失败的消息数量， 导致REQ
+	totalRdyCount    int64  // 总的RDY数，包含各连接RDY之和
+	backoffDuration  int64  // 退避的间隔时间
+	backoffCounter   int32  // 退避的次数
+	maxInFlight      int32  // 最大消费数
 
 	mtx sync.RWMutex
 
@@ -103,9 +105,9 @@ type Consumer struct {
 	behaviorDelegate interface{}
 
 	id      int64
-	topic   string
-	channel string
-	config  Config
+	topic   string // 订阅的topic
+	channel string // 订阅的channel
+	config  Config // 配置
 
 	rngMtx sync.Mutex
 	rng    *rand.Rand
@@ -114,6 +116,7 @@ type Consumer struct {
 
 	backoffMtx sync.Mutex
 
+	// conn readLoop 收到消息后，往incomingMessages发送消息，由消费端hander读取消费
 	incomingMessages chan *Message
 
 	rdyRetryMtx    sync.Mutex
@@ -287,9 +290,9 @@ func (r *Consumer) SetBehaviorDelegate(cb interface{}) {
 // This may change dynamically based on the number of connections to nsqd the Consumer
 // is responsible for.
 func (r *Consumer) perConnMaxInFlight() int64 {
-	b := float64(r.getMaxInFlight())
-	s := b / float64(len(r.conns()))
-	return int64(math.Min(math.Max(1, s), b))
+	b := float64(r.getMaxInFlight())          // 消费者最大消费数量
+	s := b / float64(len(r.conns()))          // 消费者最大消费数量/建立的连接数 = 每个连接允许最大的RDY （一个消费者可能连接多个nsqd）
+	return int64(math.Min(math.Max(1, s), b)) // 单个连接最大可消费数，r.maxInFlight 未设置则为1
 }
 
 // IsStarved indicates whether any connections for this consumer are blocked on processing
@@ -338,6 +341,7 @@ func (r *Consumer) SetLookupdHttpClient(httpclient *http.Client) {
 // producers for the configured topic.
 //
 // A goroutine is spawned to handle continual polling.
+// 连接nsqlookupd
 func (r *Consumer) ConnectToNSQLookupd(addr string) error {
 	if atomic.LoadInt32(&r.stopFlag) == 1 {
 		return errors.New("consumer stopped")
@@ -345,7 +349,7 @@ func (r *Consumer) ConnectToNSQLookupd(addr string) error {
 	if atomic.LoadInt32(&r.runningHandlers) == 0 {
 		return errors.New("no handlers")
 	}
-
+	// 构建正确的http请求地址
 	parsedAddr, err := buildLookupAddr(addr, r.topic)
 	if err != nil {
 		return err
@@ -355,11 +359,13 @@ func (r *Consumer) ConnectToNSQLookupd(addr string) error {
 
 	r.mtx.Lock()
 	for _, x := range r.lookupdHTTPAddrs {
+		// 已经连接过这个lookupd， 则直接返回
 		if x == parsedAddr {
 			r.mtx.Unlock()
 			return nil
 		}
 	}
+	// 更新连接的lookupdHTTPAddrs
 	r.lookupdHTTPAddrs = append(r.lookupdHTTPAddrs, parsedAddr)
 	if r.lookupdHttpClient == nil {
 		transport := &http.Transport{
@@ -397,6 +403,7 @@ func (r *Consumer) ConnectToNSQLookupd(addr string) error {
 // producers for the configured topic.
 //
 // A goroutine is spawned to handle continual polling.
+// 连接多个nsqlookupd
 func (r *Consumer) ConnectToNSQLookupds(addresses []string) error {
 	for _, addr := range addresses {
 		err := r.ConnectToNSQLookupd(addr)
@@ -478,30 +485,36 @@ type peerInfo struct {
 // which nsqd's provide the topic we are consuming.
 //
 // initiate a connection to any new producers that are identified.
+// lookupd中根据topic查找目标nsqd
 func (r *Consumer) queryLookupd() {
 	retries := 0
 
 retry:
+	// 下一个要查找的looupd地址
 	endpoint := r.nextLookupdEndpoint()
 
 	r.log(LogLevelInfo, "querying nsqlookupd %s", endpoint)
-
+	// 请求lookupd的返回值， 里面包含producer的信息
 	var data lookupResp
 	headers := make(http.Header)
 	if r.config.AuthSecret != "" && r.config.LookupdAuthorization {
 		headers.Set("Authorization", fmt.Sprintf("Bearer %s", r.config.AuthSecret))
 	}
+	// 请求lookupd, 并将返回值赋值给data
 	err := apiRequestNegotiateV1(r.lookupdHttpClient, "GET", endpoint, headers, &data)
 	if err != nil {
 		r.log(LogLevelError, "error querying nsqlookupd (%s) - %s", endpoint, err)
 		retries++
+		// 请求失败吗，重试3次
 		if retries < 3 {
 			r.log(LogLevelInfo, "retrying with next nsqlookupd")
 			goto retry
 		}
+		// 3次请求都失败，则结束，说明可能lookupd服务有问题
 		return
 	}
 
+	// 查询出的nsqd地址（host:port），放在nsqdAddrs中
 	var nsqdAddrs []string
 	for _, producer := range data.Producers {
 		broadcastAddress := producer.BroadcastAddress
@@ -510,9 +523,11 @@ retry:
 		nsqdAddrs = append(nsqdAddrs, joined)
 	}
 	// apply filter
+	// 根据设置的过滤条件，进一步筛选nsqd地址
 	if discoveryFilter, ok := r.behaviorDelegate.(DiscoveryFilter); ok {
 		nsqdAddrs = discoveryFilter.Filter(nsqdAddrs)
 	}
+	// 连接每一个查询到的nsqd地址
 	for _, addr := range nsqdAddrs {
 		err = r.ConnectToNSQD(addr)
 		if err != nil && err != ErrAlreadyConnected {
@@ -551,7 +566,7 @@ func (r *Consumer) ConnectToNSQD(addr string) error {
 	}
 
 	atomic.StoreInt32(&r.connectedFlag, 1)
-
+	// 构建新的tcp连接对象
 	conn := NewConn(addr, &r.config, &consumerConnDelegate{r})
 	conn.SetLoggerLevel(r.getLogLevel())
 	format := fmt.Sprintf("%3d [%s/%s] (%%s)", r.id, r.topic, r.channel)
@@ -559,12 +574,14 @@ func (r *Consumer) ConnectToNSQD(addr string) error {
 		conn.SetLoggerForLevel(r.logger[index], LogLevel(index), format)
 	}
 	r.mtx.Lock()
+	// 判断地址是否在pendingConnections，connections中，在则代表已经建立过连接
 	_, pendingOk := r.pendingConnections[addr]
 	_, ok := r.connections[addr]
 	if ok || pendingOk {
 		r.mtx.Unlock()
 		return ErrAlreadyConnected
 	}
+	// 将建立的连接放到pendingConnections中， 如果addr不在nsqdTCPAddrs列表中， 则将其加入进去
 	r.pendingConnections[addr] = conn
 	if idx := indexOf(addr, r.nsqdTCPAddrs); idx == -1 {
 		r.nsqdTCPAddrs = append(r.nsqdTCPAddrs, addr)
@@ -572,28 +589,30 @@ func (r *Consumer) ConnectToNSQD(addr string) error {
 	r.mtx.Unlock()
 
 	r.log(LogLevelInfo, "(%s) connecting to nsqd", addr)
-
+	// 连接清除函数
 	cleanupConnection := func() {
 		r.mtx.Lock()
 		delete(r.pendingConnections, addr)
 		r.mtx.Unlock()
 		conn.Close()
 	}
-
+	// 建立连接，发送INDENTIFY请求， 开启goroutine开始发送和接收数据
 	resp, err := conn.Connect()
+	// 如果出错， 清除连接
 	if err != nil {
 		cleanupConnection()
 		return err
 	}
 
 	if resp != nil {
+		// 客户端设置的MaxRdyCount大于服务端传回的MaxRdyCount，则客户端MaxRdyCount可能会被截断 todo 真的会截断吗
 		if resp.MaxRdyCount < int64(r.getMaxInFlight()) {
 			r.log(LogLevelWarning,
 				"(%s) max RDY count %d < consumer max in flight %d, truncation possible",
 				conn.String(), resp.MaxRdyCount, r.getMaxInFlight())
 		}
 	}
-
+	// 发送SUB
 	cmd := Subscribe(r.topic, r.channel)
 	err = conn.WriteCommand(cmd)
 	if err != nil {
@@ -603,6 +622,7 @@ func (r *Consumer) ConnectToNSQD(addr string) error {
 	}
 
 	r.mtx.Lock()
+	// 将连接从pendingConnections移除，并添加到connections
 	delete(r.pendingConnections, addr)
 	r.connections[addr] = conn
 	r.mtx.Unlock()
@@ -816,17 +836,21 @@ func (r *Consumer) startStopContinueBackoff(conn *Conn, signal backoffSignal) {
 	backoffCounter := atomic.LoadInt32(&r.backoffCounter)
 	switch signal {
 	case resumeFlag:
+		// message Finish 触发OnResume ，backoffCounter-1
 		if backoffCounter > 0 {
 			backoffCounter--
 			backoffUpdated = true
 		}
 	case backoffFlag:
-		nextBackoff := r.config.BackoffStrategy.Calculate(int(backoffCounter) + 1)
+		// message Requeue 触发OnBackoff ，backoffCounter+1
+		nextBackoff := r.config.BackoffStrategy.Calculate(int(backoffCounter) + 1) // 接下来退避需要等待的时间
+		// 如果接下来退避需要等待的时间<=设置的最大退避需要等待的时间
 		if nextBackoff <= r.config.MaxBackoffDuration {
-			backoffCounter++
-			backoffUpdated = true
+			backoffCounter++      // 退避计数+1
+			backoffUpdated = true // 更新backoff state
 		}
 	}
+	// 原子性更新r.backoffCounter
 	atomic.StoreInt32(&r.backoffCounter, backoffCounter)
 
 	if r.backoffCounter == 0 && backoffUpdated {
@@ -857,13 +881,14 @@ func (r *Consumer) startStopContinueBackoff(conn *Conn, signal backoffSignal) {
 }
 
 func (r *Consumer) backoff(d time.Duration) {
-	atomic.StoreInt64(&r.backoffDuration, d.Nanoseconds())
-	time.AfterFunc(d, r.resume)
+	atomic.StoreInt64(&r.backoffDuration, d.Nanoseconds()) // r.backoffDuration更新为d.Nanoseconds()
+	time.AfterFunc(d, r.resume)                            // d时间之后执行r.resume
 }
 
 func (r *Consumer) resume() {
+	// 如果r stop 了 则直接返回
 	if atomic.LoadInt32(&r.stopFlag) == 1 {
-		atomic.StoreInt64(&r.backoffDuration, 0)
+		atomic.StoreInt64(&r.backoffDuration, 0) // r.backoffDuration更新为0
 		return
 	}
 
@@ -1003,6 +1028,7 @@ func (r *Consumer) sendRDY(c *Conn, count int64) error {
 	return nil
 }
 
+// redistributeRDY 重新分配各连接的RDY
 func (r *Consumer) redistributeRDY() {
 	if r.inBackoffTimeout() {
 		return
@@ -1010,13 +1036,13 @@ func (r *Consumer) redistributeRDY() {
 
 	// if an external heuristic set needRDYRedistributed we want to wait
 	// until we can actually redistribute to proceed
-	conns := r.conns()
+	conns := r.conns() // 当前的所有连接
 	if len(conns) == 0 {
 		return
 	}
 
-	maxInFlight := r.getMaxInFlight()
-	if len(conns) > int(maxInFlight) {
+	maxInFlight := r.getMaxInFlight()  // 允许最大消费数
+	if len(conns) > int(maxInFlight) { // 连接数超过了最大消费限制
 		r.log(LogLevelDebug, "redistributing RDY state (%d conns > %d max_in_flight)",
 			len(conns), maxInFlight)
 		atomic.StoreInt32(&r.needRDYRedistributed, 1)
@@ -1033,8 +1059,8 @@ func (r *Consumer) redistributeRDY() {
 
 	possibleConns := make([]*Conn, 0, len(conns))
 	for _, c := range conns {
-		lastMsgDuration := time.Now().Sub(c.LastMessageTime())
-		lastRdyDuration := time.Now().Sub(c.LastRdyTime())
+		lastMsgDuration := time.Now().Sub(c.LastMessageTime()) // 离上一次接收消息隔离了多长时间
+		lastRdyDuration := time.Now().Sub(c.LastRdyTime())     // 离上一次RDY更新间隔时间
 		rdyCount := c.RDY()
 		r.log(LogLevelDebug, "(%s) rdy: %d (last message received %s)",
 			c.String(), rdyCount, lastMsgDuration)
@@ -1144,7 +1170,7 @@ func (r *Consumer) handlerLoop(handler Handler) {
 		}
 
 		if r.shouldFailMessage(message, handler) {
-			message.Finish()
+			message.Finish() // 消息结束， 发送msgResponse到writeLoop里的c.msgResponseChan
 			continue
 		}
 
@@ -1171,6 +1197,7 @@ exit:
 
 func (r *Consumer) shouldFailMessage(message *Message, handler interface{}) bool {
 	// message passed the max number of attempts
+	// message.Attempts 服务端返回
 	if r.config.MaxAttempts > 0 && message.Attempts > r.config.MaxAttempts {
 		r.log(LogLevelWarning, "msg %s attempted %d times, giving up",
 			message.ID, message.Attempts)

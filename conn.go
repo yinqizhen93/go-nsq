@@ -50,35 +50,35 @@ type msgResponse struct {
 type Conn struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
 	messagesInFlight int64
-	maxRdyCount      int64
-	rdyCount         int64
-	lastRdyTimestamp int64
-	lastMsgTimestamp int64
+	maxRdyCount      int64 // 连接的当前的最大ready值，
+	rdyCount         int64 // 连接的当前的ready值，
+	lastRdyTimestamp int64 // 连接上一次修改ready值的时间，
+	lastMsgTimestamp int64 // 连接上一次接收消息的时间，接收消息？
 
 	mtx sync.Mutex
 
-	config *Config
+	config *Config // 连接的配置
 
-	conn    *net.TCPConn
+	conn    *net.TCPConn // 实际的tcp连接
 	tlsConn *tls.Conn
 	addr    string
 
-	delegate ConnDelegate
+	delegate ConnDelegate // 连接的回调函数
 
-	logger   []logger
+	logger   []logger // 用于记录日志
 	logLvl   LogLevel
 	logFmt   []string
 	logGuard sync.RWMutex
 
-	r io.Reader
-	w io.Writer
+	r io.Reader // conn 从其中读取消息
+	w io.Writer // conn 往里面写入消息
 
-	cmdChan         chan *Command
-	msgResponseChan chan *msgResponse
-	exitChan        chan int
+	cmdChan         chan *Command     // 接收 command 消息的channel
+	msgResponseChan chan *msgResponse // 消费者消费消息后，往msgResponseChan发送消息
+	exitChan        chan int          // 接收退出信号
 	drainReady      chan int
 
-	closeFlag int32
+	closeFlag int32 // 标识连接是否关闭
 	stopper   sync.Once
 	wg        sync.WaitGroup
 
@@ -232,6 +232,7 @@ func (c *Conn) IsClosing() bool {
 }
 
 // RDY returns the current RDY count
+// 该连接设置的ready值
 func (c *Conn) RDY() int64 {
 	return atomic.LoadInt64(&c.rdyCount)
 }
@@ -321,6 +322,7 @@ func (c *Conn) Flush() error {
 	return nil
 }
 
+// identify 连接建立后，消费端和nsqd同步一些信息
 func (c *Conn) identify() (*IdentifyResponse, error) {
 	ci := make(map[string]interface{})
 	ci["client_id"] = c.config.ClientID
@@ -514,6 +516,8 @@ func (c *Conn) auth(secret string) error {
 
 // readLoop循环读取nsqd返回的消息
 func (c *Conn) readLoop() {
+	// 实现了MessageDelegate接口
+	// delegate.OnFinish 调用c.onMessageFinish 向 c.msgResponseChan发送msgResponse
 	delegate := &connMessageDelegate{c}
 	for {
 		if atomic.LoadInt32(&c.closeFlag) == 1 {
@@ -550,7 +554,7 @@ func (c *Conn) readLoop() {
 		// 对生产者建立的连接，将 w.responseChan <- data， w为producer
 		case FrameTypeResponse:
 			c.delegate.OnResponse(c, data)
-			// FrameTypeMessage正常接收到消息
+		// FrameTypeMessage正常接收到消息
 		case FrameTypeMessage:
 			// 解析放回的消息
 			msg, err := DecodeMessage(data)
@@ -564,7 +568,9 @@ func (c *Conn) readLoop() {
 
 			atomic.AddInt64(&c.messagesInFlight, 1)
 			atomic.StoreInt64(&c.lastMsgTimestamp, time.Now().UnixNano())
-			// 往incomingMsg channel发送接收到的msg， 消费端Handler 消费消息
+			// 往incomingMsg channel发送接收到的msg， 消费端Handler 消费消息,
+			// msg.Delegate 实现了MessageDelegate接口
+			// msg.Delegate.OnFinish 调用c.onMessageFinish 向 c.msgResponseChan发送msgResponse
 			c.delegate.OnMessage(c, msg)
 		case FrameTypeError:
 			c.log(LogLevelError, "protocol error - %s", data)
@@ -609,13 +615,15 @@ func (c *Conn) writeLoop() {
 				c.close()
 				continue
 			}
+		//
 		// 消费者收到服务端推送消息，按消费情况，处理，
 		// 消费成功 OnMessageFinished 发送FIN告诉nsqd消费成功，可以删除这条消息
 		// 消费失败 OnMessageRequeued 发送REQ告诉nsq消费失败， 需要将这条消息重新放入队列
 		case resp := <-c.msgResponseChan:
 			// Decrement this here so it is correct even if we can't respond to nsqd
 			msgsInFlight := atomic.AddInt64(&c.messagesInFlight, -1)
-
+			// OnFinish resp.success == true
+			// OnRequeue resp.success == false
 			if resp.success {
 				c.log(LogLevelDebug, "FIN %s", resp.msg.ID)
 				c.delegate.OnMessageFinished(c, resp.msg)
